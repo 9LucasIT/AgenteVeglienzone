@@ -518,6 +518,16 @@ def _is_valuation_intent(t: str) -> bool:
     keys = ["tasacion", "tasación", "tasar", "tasaciones"]
     return any(k in t for k in keys) or t.strip() in {"3", "3-", "3 -"}
 
+
+def _is_opt_out(t: str) -> bool:
+    nt = _strip_accents(t)
+    nt = re.sub(r"[!¿?\.]", "", nt).strip()
+    return nt == "cancelar"
+
+def _is_reactivate(t: str) -> bool:
+    nt = _strip_accents(t)
+    return nt.strip() == "activar bot"
+
 def _is_zone_search(t: str) -> bool:
     nt = _strip_accents(t)
     patterns = [
@@ -570,6 +580,29 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
     _ensure_session(chat_id)
     s = STATE[chat_id]
+
+    # Reactivar el bot manualmente
+    if _is_reactivate(text):
+        s["opt_out"] = False
+        s["handoff"] = False
+        _reset(chat_id)
+        return QualifyOut(reply_text=_say_menu())
+
+    # Opt-out: el usuario pide que el bot no intervenga más
+    if _is_opt_out(text):
+        s["opt_out"] = True
+        s["handoff"] = False
+        s["stage"] = "opt_out"
+        return QualifyOut(
+            reply_text=(
+                "Perfecto, dejo de responder tus mensajes por este WhatsApp. "
+                "Si en algún momento querés volver a usar el asistente, escribí *\"activar bot\"*."
+            )
+        )
+
+    # Si el contacto está en opt-out o en modo handoff al humano, el bot permanece en silencio
+    if s.get("opt_out") or s.get("handoff"):
+        return QualifyOut(reply_text="")
 
     if _wants_reset(text):
         _reset(chat_id)
@@ -677,6 +710,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
     if stage == "tas_disp":
         s["tas_disp"] = text.strip() or "no informado"
         s["stage"] = "done"
+        s["handoff"] = True
         resumen = (
             "Tasación solicitada ✅\n"
             f"• Operación: {s.get('tas_op','N/D')}\n"
@@ -811,6 +845,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
         if _is_yes(text):
             s["stage"] = "done"
+            s["handoff"] = True
             disp = ""
             if s.get("disp_alquiler"):
                 disp = f"Disponibilidad: {s['disp_alquiler']}\n"
