@@ -22,6 +22,8 @@ MYSQL_TABLE = os.getenv("MYSQL_TABLE", "propiedades")
 
 STATE: Dict[str, Dict[str, Any]] = {}
 
+SILENCE_REPLY = "\u200B"
+
 app = FastAPI(title="FastAPI WhatsApp Agent (DB)", version="2025-11-03")
 
 # =============== IO ===============
@@ -571,7 +573,6 @@ def _is_zone_search(t: str) -> bool:
     ]
     return any(re.search(p, nt) for p in patterns)
 
-
 # ======== Tasación ========
 def _num_from_text(t: str) -> Optional[int]:
     m = re.search(r"\b(\d{1,5})\b", t or "")
@@ -613,37 +614,69 @@ def _ensure_session(chat_id: str):
 # =============== Endpoint principal ===============
 @app.post("/qualify", response_model=QualifyOut)
 async def qualify(body: QualifyIn) -> QualifyOut:
+    """
+    Orquestador principal de la conversación.
+    Soporta:
+      - "reset"        -> reinicia la conversación
+      - "cancelar"     -> apaga el bot para este chat (silencio total)
+      - "activar bot"  -> vuelve a encender el bot (reset al menú)
+    Además, cuando se deriva a un asesor (vendor_push=True) se marca handoff
+    y el bot permanece en silencio hasta "activar bot".
+    """
     chat_id = body.chatId
     text = (body.message or "").strip()
 
     _ensure_session(chat_id)
     s = STATE[chat_id]
 
+    # --------- CONTROL ENCENDIDO / APAGADO ---------
     # Reactivar manualmente el bot
     if _is_reactivate(text):
         s["opt_out"] = False
         s["handoff"] = False
         _reset(chat_id)
-        return QualifyOut(reply_text=_say_menu())
+        return QualifyOut(
+            reply_text=_say_menu(),
+            vendor_push=False,
+            vendor_message="",
+            closing_text=""
+        )
 
-    # Opt-out definitivo
+    # Apagar el bot con "cancelar"
     if _is_opt_out(text):
         s["opt_out"] = True
         s["handoff"] = False
         s["stage"] = "opt_out"
-        return QualifyOut(reply_text="")
+        # Respondemos una vez con un aviso corto y luego quedará silencioso
+        return QualifyOut(
+            reply_text="OK, dejo de responder por este chat. Si querés volver a usar el asistente, escribí *activar bot*.",
+            vendor_push=False,
+            vendor_message="",
+            closing_text=""
+        )
 
-    # Si ya está apagado (opt-out) o en handoff, silencio total
+    # Si ya está apagado o derivado a un asesor, silencio total (char invisible)
     if s.get("opt_out") or s.get("handoff"):
-        return QualifyOut(reply_text="")
+        return QualifyOut(
+            reply_text=SILENCE_REPLY,
+            vendor_push=False,
+            vendor_message="",
+            closing_text=""
+        )
 
+    # Reset clásico
     if _wants_reset(text):
         _reset(chat_id)
-        return QualifyOut(reply_text=_say_menu())
+        return QualifyOut(
+            reply_text=_say_menu(),
+            vendor_push=False,
+            vendor_message="",
+            closing_text=""
+        )
 
     stage = s.get("stage", "menu")
 
-    # --- MENU ---
+    # ================== MENU ==================
     if stage == "menu":
         if not text:
             return QualifyOut(reply_text=_say_menu())
@@ -669,6 +702,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 s["last_prompt"] = "qual_disp_venta"
                 return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt("venta"))
 
+        # Alquiler / Venta / Tasación sin link
         if user_op or _is_valuation_intent(text):
             s["intent"] = user_op or "tasacion"
             if s["intent"] == "tasacion":
@@ -682,10 +716,17 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 s["tas_disp"] = None
                 return QualifyOut(
                     reply_text="¡Genial! Para la *tasación*, decime el *tipo de operación*: ¿venta o alquiler?",
-                    closing_text="",
+                    vendor_push=False,
+                    vendor_message="",
+                    closing_text=""
                 )
             s["stage"] = "ask_zone_or_address"
-            return QualifyOut(reply_text=_ask_zone_or_address())
+            return QualifyOut(
+                reply_text=_ask_zone_or_address(),
+                vendor_push=False,
+                vendor_message="",
+                closing_text=""
+            )
 
         return QualifyOut(reply_text=_say_menu())
 
@@ -699,17 +740,23 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         else:
             return QualifyOut(reply_text="¿Me confirmás el *tipo de operación*? (venta o alquiler)")
         s["stage"] = "tas_prop"
-        return QualifyOut(reply_text="Perfecto. ¿Cuál es el *tipo de propiedad*? (ej.: departamento, casa, local, oficina)")
+        return QualifyOut(
+            reply_text="Perfecto. ¿Cuál es el *tipo de propiedad*? (ej.: departamento, casa, local, oficina)"
+        )
 
     if stage == "tas_prop":
         s["tas_prop"] = text.strip() or "no informado"
         s["stage"] = "tas_m2"
-        return QualifyOut(reply_text="Gracias. ¿Cuántos *metros cuadrados* aproximados tiene la propiedad?")
+        return QualifyOut(
+            reply_text="Gracias. ¿Cuántos *metros cuadrados* aproximados tiene la propiedad?"
+        )
 
     if stage == "tas_m2":
         n = _num_from_text(text)
         if n is None:
-            return QualifyOut(reply_text="¿Me pasás un *número* aproximado de metros cuadrados? (ej.: 65)")
+            return QualifyOut(
+                reply_text="¿Me pasás un *número* aproximado de metros cuadrados? (ej.: 65)"
+            )
         s["tas_m2"] = n
         s["stage"] = "tas_dir"
         return QualifyOut(
@@ -718,7 +765,9 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
     if stage == "tas_dir":
         if not _has_addr_number_strict(text):
-            return QualifyOut(reply_text="¿Podés pasarme *calle y número*? Si tenés piso/depto, mejor.")
+            return QualifyOut(
+                reply_text="¿Podés pasarme *calle y número*? Si tenés piso/depto, mejor."
+            )
         s["tas_dir"] = text.strip()
         s["stage"] = "tas_exp"
         return QualifyOut(
@@ -731,10 +780,11 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             s["tas_exp"] = "no tiene"
         else:
             val = _money_from_text(text)
-            s["tas_exp"] = f"${val:,}".replace(",", ".") if val else (text.strip() or "no informado")
+            s["tas_exp"] = f"{val:,}".replace(",", ".") if val else (text.strip() or "no informado")
         s["stage"] = "tas_feat"
         return QualifyOut(
-            reply_text="¿Dispone *balcón, patio, amenities o estudio de factibilidad*? Podés responder con una lista (ej.: “balcón y amenities”) o “no”."
+            reply_text="¿Dispone *balcón, patio, amenities o estudio de factibilidad*? "
+                       "Podés responder con una lista (ej.: “balcón y amenities”) o “no”."
         )
 
     if stage == "tas_feat":
@@ -759,7 +809,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
     if stage == "tas_disp":
         s["tas_disp"] = text.strip() or "no informado"
         s["stage"] = "done"
-        s["handoff"] = True
+        s["handoff"] = True  # a partir de ahora: silencio total
         resumen = (
             "Tasación solicitada ✅\n"
             f"• Operación: {s.get('tas_op','N/D')}\n"
@@ -779,7 +829,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             reply_text=cierre,
             vendor_push=True,
             vendor_message=resumen,
-            closing_text="",
+            closing_text=""
         )
 
     # --- DIRECCIÓN / LINK ---
@@ -810,7 +860,12 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 f"{SITE_URL}\n\n"
                 "Cualquier consulta puntual de una ficha me escribís por acá."
             )
-            return QualifyOut(reply_text=msg, closing_text=_farewell())
+            return QualifyOut(
+                reply_text=msg,
+                vendor_push=False,
+                vendor_message="",
+                closing_text=_farewell()
+            )
 
         intent = s.get("intent", "alquiler")
         row = search_db_by_address(text)
@@ -857,7 +912,9 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                             "Si más adelante contás con ellos, escribinos por este mismo chat y con gusto te ayudamos 💬\n\n"
                             "🔄 Para reiniciar la conversación, enviá *\"reset\"*."
                         ),
-                        closing_text=_farewell(),
+                        vendor_push=False,
+                        vendor_message="",
+                        closing_text=_farewell()
                     )
 
                 if _is_yes(text) or re.search(r"(ingreso|recibo|demostrable|monotrib|dependencia)", nt):
@@ -881,9 +938,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 s["stage"] = "ask_handover"
                 s.pop("last_prompt", None)
                 return QualifyOut(
-                    reply_text=(
-                        "Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
-                    )
+                    reply_text="Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
                 )
 
         if intent == "venta":
@@ -895,9 +950,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 s["stage"] = "ask_handover"
                 s.pop("last_prompt", None)
                 return QualifyOut(
-                    reply_text=(
-                        "Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
-                    )
+                    reply_text="Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
                 )
 
     # --- CONTACTO CON ASESOR ---
@@ -906,7 +959,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
         if _is_yes(text):
             s["stage"] = "done"
-            s["handoff"] = True
+            s["handoff"] = True  # a partir de ahora: silencio total
             disp = ""
             if s.get("disp_alquiler"):
                 disp = f"Disponibilidad: {s['disp_alquiler']}\n"
@@ -934,7 +987,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 reply_text="Perfecto, te derivo con un asesor humano que te contactará por acá. ¡Gracias!",
                 vendor_push=True,
                 vendor_message=vendor_msg,
-                closing_text=_farewell(),
+                closing_text=_farewell()
             )
 
         if _is_no(text):
@@ -944,12 +997,19 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                     "¡Gracias por tu consulta! Quedamos a disposición por cualquier otra duda.\n"
                     "Cuando quieras retomar, escribí *reset* y arrancamos desde cero."
                 ),
-                closing_text=_farewell(),
+                vendor_push=False,
+                vendor_message="",
+                closing_text=_farewell()
             )
 
         return QualifyOut(
             reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? Respondé *sí* o *no*."
         )
 
-    # Fallback silencioso por cualquier estado no contemplado
-    return QualifyOut(reply_text="")
+    # ========== FALLBACK SILENCIOSO ==========
+    return QualifyOut(
+        reply_text=SILENCE_REPLY,
+        vendor_push=False,
+        vendor_message="",
+        closing_text=""
+    )
