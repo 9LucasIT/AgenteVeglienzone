@@ -990,6 +990,70 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             closing_text="",
         )
 
+    # 🔚 Fallback: SILENCIO (sin mensaje de error)
+    return QualifyOut(
+        reply_text="",
+        vendor_push=False,
+        vendor_message="",
+        closing_text="",
+    )
+
+    # --- CONTACTO CON ASESOR ---
+    if stage == "ask_handover":
+        s.pop("last_prompt", None)
+
+        if _is_yes(text):
+            s["stage"] = "done"
+            s["handoff"] = True  # a partir de ahora: silencio total
+            disp = ""
+            if s.get("disp_alquiler"):
+                disp = f"Disponibilidad: {s['disp_alquiler']}\n"
+            elif s.get("disp_venta"):
+                disp = f"Disponibilidad: {s['disp_venta']}\n"
+
+            op_line = ""
+            if s.get("intent"):
+                op_line = f"Operación seleccionada: {s['intent'].capitalize()}\n"
+
+            gar_line = ""
+            if s.get("intent") == "alquiler" and s.get("garantia"):
+                gar_line = f"Garantía: {s['garantia']}\n"
+
+            vendor_msg = (
+                "Lead calificado desde WhatsApp.\n"
+                f"Chat: {chat_id}\n"
+                f"{op_line}"
+                f"{gar_line}"
+                f"{disp}"
+                f"{s.get('prop_brief','')}\n"
+            )
+
+            return QualifyOut(
+                reply_text="Perfecto, te derivo con un asesor humano que te contactará por acá. ¡Gracias!",
+                vendor_push=True,
+                vendor_message=vendor_msg,
+                closing_text=_farewell(),
+            )
+
+        if _is_no(text):
+            s["stage"] = "done"
+            return QualifyOut(
+                reply_text=(
+                    "¡Gracias por tu consulta! Quedamos a disposición por cualquier otra duda.\n"
+                    "Cuando quieras retomar, escribí *reset* y arrancamos desde cero."
+                ),
+                vendor_push=False,
+                vendor_message="",
+                closing_text=_farewell(),
+            )
+
+        return QualifyOut(
+            reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? Respondé *sí* o *no*.",
+            vendor_push=False,
+            vendor_message="",
+            closing_text="",
+        )
+
     # Fallback por si cae en un estado inesperado
     return QualifyOut(
         reply_text="Estoy con un inconveniente técnico, ¿podrías repetirme la consulta o escribir *reset* para empezar de nuevo?",
