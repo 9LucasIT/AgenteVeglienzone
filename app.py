@@ -1,4 +1,3 @@
-# app.py
 import os
 import re
 import unicodedata
@@ -9,9 +8,14 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
+from groq import Groq
 
-SITE_URL = os.getenv("SITE_URL", "https://www.veglienzone.com.ar/").strip()
 
+# ==================== CONFIG BÁSICA ====================
+
+SITE_URL = os.getenv("SITE_URL", "https://www.fincasdeleste.com.uy/")
+
+# MySQL (igual que antes)
 DATABASE_URL = os.getenv("DATABASE_URL", "") or os.getenv("MYSQL_URL", "")
 MYSQL_HOST = os.getenv("MYSQLHOST") or os.getenv("MYSQL_HOST")
 MYSQL_PORT = int(os.getenv("MYSQLPORT") or os.getenv("MYSQL_PORT") or "3306")
@@ -20,13 +24,27 @@ MYSQL_PASSWORD = os.getenv("MYSQLPASSWORD") or os.getenv("MYSQL_PASSWORD")
 MYSQL_DB = os.getenv("MYSQLDATABASE") or os.getenv("MYSQL_DATABASE")
 MYSQL_TABLE = os.getenv("MYSQL_TABLE", "propiedades")
 
+# Green API
+GREEN_API_URL = os.getenv("GREEN_API_URL", "https://api.green-api.com").rstrip("/")
+GREEN_INSTANCE_ID = os.getenv("GREEN_INSTANCE_ID") or os.getenv("GREEN_API_INSTANCE_ID")
+GREEN_API_TOKEN = os.getenv("GREEN_API_TOKEN") or os.getenv("GREEN_TOKEN")
+
+# Chat del asesor (puede ser número o grupo)
+VENDOR_CHAT_ID = os.getenv("VENDOR_CHAT_ID", "").strip()  # ej: "5493412654593@c.us"
+
+# IA - Groq / LLaMA-3
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+LLAMA_MODEL = os.getenv("LLAMA_MODEL", "llama3-70b-8192")
+groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+# Estado en memoria
 STATE: Dict[str, Dict[str, Any]] = {}
 
-SILENCE_REPLY = "\u200B"
+app = FastAPI(title="WhatsApp Inmo Agent (Forja/Fincas, sin n8n)", version="2025-12-10")
 
-app = FastAPI(title="FastAPI WhatsApp Agent (DB)", version="2025-11-03")
 
-# =============== IO ===============
+# ==================== MODELOS I/O ====================
+
 class QualifyIn(BaseModel):
     chatId: str
     message: Optional[str] = ""
@@ -41,7 +59,8 @@ class QualifyOut(BaseModel):
     closing_text: str = ""
 
 
-# =============== Texto helpers ===============
+# ==================== HELPERS DE TEXTO ====================
+
 def _strip_accents(s: str) -> str:
     if not s:
         return ""
@@ -50,7 +69,6 @@ def _strip_accents(s: str) -> str:
 
 
 def _s(v) -> str:
-    """To-string seguro con strip (evita .strip() sobre float/Decimal/None)."""
     try:
         if v is None:
             return ""
@@ -61,7 +79,7 @@ def _s(v) -> str:
 
 def _say_menu() -> str:
     return (
-        "¡Hola! 👋 Soy el asistente virtual de *Veglienzone Gestión Inmobiliaria*.\n"
+        "¡Hola! 👋 Soy el asistente virtual de *Inmobiliaria Finca del Este*.\n"
         "Gracias por contactarte con nosotros. ¿En qué te puedo ayudar hoy?\n\n"
         "1️⃣ *Alquileres*\n"
         "2️⃣ *Ventas*\n"
@@ -106,7 +124,8 @@ def _farewell() -> str:
     return "Perfecto, quedo atento a tus consultas. ¡Gracias por escribir! 😊"
 
 
-# =============== DB ===============
+# ==================== DB (igual esquema anterior) ====================
+
 try:
     import pymysql
     from pymysql.cursors import DictCursor
@@ -160,8 +179,7 @@ def _safe_connect():
 def _build_like_patterns(raw: str) -> List[str]:
     text = raw.strip()
     text_no_al = re.sub(r"\b(al|altura)\b", "", text, flags=re.I).strip()
-    num_match = re.search(r"\d{1,5}", text)
-    num = num_match.group(0) if num_match else ""
+    num = (re.search(r"\d{1,5}", text) or re.match("", "")).group(0) if re.search(r"\d{1,5}", text) else ""
     street = re.sub(r"\d{1,5}", "", text).strip()
 
     pats = [f"%{text}%"]
@@ -188,12 +206,11 @@ def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_to
         for pat in patterns:
             if len(rows) >= limit_total:
                 break
-            # intento con expensas
             try:
                 cur.execute(
                     f"""
                     SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                           precio_venta, precio_alquiler, total_construido, expensas
+                           precio_venta, precio_alquiler, total_construido, superficie, expensas
                     FROM `{table}`
                     WHERE direccion LIKE %s
                     LIMIT %s
@@ -203,12 +220,11 @@ def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_to
                 rows.extend(cur.fetchall() or [])
                 continue
             except Exception:
-                # compat: sin expensas
                 try:
                     cur.execute(
                         f"""
                         SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                               precio_venta, precio_alquiler, total_construido
+                               precio_venta, precio_alquiler, total_construido, superficie
                         FROM `{table}`
                         WHERE direccion LIKE %s
                         LIMIT %s
@@ -218,6 +234,7 @@ def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_to
                     batch = cur.fetchall() or []
                     for r in batch:
                         r.setdefault("expensas", None)
+                        r.setdefault("superficie", None)
                     rows.extend(batch)
                 except Exception:
                     pass
@@ -264,7 +281,7 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
                 cur.execute(
                     f"""
                     SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                           precio_venta, precio_alquiler, total_construido, expensas
+                           precio_venta, precio_alquiler, total_construido, superficie, expensas
                     FROM `{MYSQL_TABLE}`
                     WHERE zona LIKE %s
                     ORDER BY id DESC
@@ -278,7 +295,7 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
                 cur.execute(
                     f"""
                     SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                           precio_venta, precio_alquiler, total_construido
+                           precio_venta, precio_alquiler, total_construido, superficie
                     FROM `{MYSQL_TABLE}`
                     WHERE zona LIKE %s
                     ORDER BY id DESC
@@ -289,6 +306,7 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
                 row = cur.fetchone() or None
                 if row is not None:
                     row.setdefault("expensas", None)
+                    row.setdefault("superficie", None)
                 return row
     except Exception:
         return None
@@ -299,68 +317,23 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
             pass
 
 
-# =============== Render ficha ===============
-def _to_int(x, default=0):
-    try:
-        if x is None:
-            return default
-        s = str(x).strip()
-        if s == "":
-            return default
-        return int(float(s))
-    except Exception:
-        return default
-
-
-def _fmt_money(v) -> str:
-    try:
-        if v is None:
-            return "Consultar"
-        s = _s(v)
-        if s == "" or s == "0" or s.lower() in {"null", "none"}:
-            return "Consultar"
-        f = float(s.replace(".", "").replace(",", "."))
-        if f <= 0:
-            return "Consultar"
-        return f"USD {int(f):,}".replace(",", ".")
-    except Exception:
-        return "Consultar"
-
-
-def _has_price(v) -> bool:
-    try:
-        s = _s(v)
-        if s == "" or s.lower() in {"null", "none"}:
-            return False
-        f = float(s.replace(".", "").replace(",", "."))
-        return f > 0
-    except Exception:
-        return False
-
+# ==================== RENDER FICHA ====================
 
 def _fmt_expensas_guess(raw) -> str:
-    """
-    Formatea 'expensas' viniendo como número o texto.
-    Evita el bug de 357000.0 -> 3.570.000 parseando el primer token numérico con decimales.
-    """
     if raw is None:
         return "—"
     s = _s(raw)
     if not s or s.lower() in {"null", "none", "-", "na"}:
         return "—"
-
-    # Buscar el primer número con opcional decimal, p.ej. "357000.0", "357.000,50", "357000"
     m = re.search(r"(\d+(?:[.,]\d+)?)", s.replace(" ", ""))
     if m:
-        token = m.group(1).replace(",", ".")  # normalizar coma decimal
+        token = m.group(1).replace(",", ".")
         try:
             val = float(token)
-            n = int(round(val))  # a entero para mostrar en ARS
+            n = int(round(val))
             return f"$ {n:,}".replace(",", ".")
         except Exception:
             pass
-
-    # Si no se pudo parsear, devolvemos el texto crudo (sin tocar)
     return s
 
 
@@ -385,7 +358,8 @@ def render_property_card_db(row: dict, intent: str) -> str:
 
     precio_venta = _s(row.get("precio_venta"))
     precio_alquiler = _s(row.get("precio_alquiler"))
-    total_construido = _s(row.get("total_construido"))
+    total_construido_raw = row.get("total_construido")
+    superficie_raw = row.get("superficie")
     expensas_raw = row.get("expensas")
     expensas_txt = _fmt_expensas_guess(expensas_raw)
 
@@ -395,31 +369,42 @@ def render_property_card_db(row: dict, intent: str) -> str:
         s2 = s.lower().strip()
         return s2 in {"null", "none", "-", "consultar", "0"}
 
-    # Detectar tipo de operación
-    if not _is_empty(precio_alquiler):
+    if intent == "alquiler":
         operacion = "alquiler"
-        valor = precio_alquiler
-    elif not _is_empty(precio_venta):
+        valor = precio_alquiler if not _is_empty(precio_alquiler) else "Consultar"
+    elif intent == "venta":
         operacion = "venta"
-        valor = precio_venta
+        valor = precio_venta if not _is_empty(precio_venta) else "Consultar"
     else:
-        operacion = "—"
-        valor = "Consultar"
+        if not _is_empty(precio_alquiler):
+            operacion = "alquiler"
+            valor = precio_alquiler
+        elif not _is_empty(precio_venta):
+            operacion = "venta"
+            valor = precio_venta
+        else:
+            operacion = "—"
+            valor = "Consultar"
 
-    # Superficie
-    if _is_empty(total_construido):
-        sup_txt = "—"
-    else:
-        sup_txt = total_construido
-        if sup_txt.replace(".", "", 1).isdigit():
-            sup_txt = f"{sup_txt} m²"
+    def _fmt_m2(val) -> str:
+        s = _s(val)
+        if not s:
+            return "—"
+        s_clean = s.lower().replace("m2", "").replace("m²", "").strip()
+        if s_clean.replace(".", "", 1).isdigit():
+            return f"{s_clean} m²"
+        return s
+
+    total_construido_txt = _fmt_m2(total_construido_raw)
+    superficie_txt = _fmt_m2(superficie_raw)
 
     ficha = (
         f"🏡 *{tprop}*\n"
         f"{addr} (Zona: {zona})\n\n"
         f"💰 *Operación:* {operacion.capitalize()}\n"
         f"💸 *Valor:* {valor}\n"
-        f"📏 *Superficie:* {sup_txt}\n"
+        f"🏗 *Total construido:* {total_construido_txt}\n"
+        f"📐 *Superficie:* {superficie_txt}\n"
         f"🛏 *Ambientes:* {amb} | Dormitorios: {dorm}\n"
         f"🚗 *Cochera:* {coch_txt}\n"
     )
@@ -429,13 +414,14 @@ def render_property_card_db(row: dict, intent: str) -> str:
 
     ficha += f"\n🌐 Más info: {SITE_URL}"
 
-    if (intent == "alquiler") or (operacion == "alquiler"):
+    if intent == "alquiler":
         ficha += "\n\n📝 *Importante:* Se realizan contratos a 24 meses con ajuste cada 3 meses por IPC."
 
     return ficha
 
 
-# === LINKS ===
+# ==================== LINKS / INTENTOS ====================
+
 URL_RX = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
 STOPWORDS = {"en", "de", "del", "la", "el", "y", "a", "con", "por", "para", "un", "una", "los", "las", "—", "–"}
 
@@ -489,41 +475,29 @@ def _try_property_from_link_or_slug(text: str) -> Optional[dict]:
     return None
 
 
-# === Validación operación vs propiedad ===
-def _mismatch_msg(user_op: str, prop_op: str) -> str:
-    return (
-        f"Atenti 👀 La propiedad que enviaste está publicada para *{prop_op}*, "
-        f"pero seleccionaste *{user_op}*.\n\n"
-        "Te vuelvo al inicio así elegís la operación correcta o compartís otra propiedad.\n\n"
-        + _say_menu()
-    )
-
-
-# === YES/NO y parsing guarantee ===
 def _is_yes(t: str) -> bool:
     t = _strip_accents(t)
-    return t in {"si", "sí", "ok", "dale", "claro", "perfecto", "de una", "si, claro", "listo", "afirmativo"}
+    return t in {
+        "si",
+        "sí",
+        "ok",
+        "dale",
+        "claro",
+        "perfecto",
+        "de una",
+        "si, claro",
+        "listo",
+        "afirmativo",
+        "si quiero",
+        "si, quiero",
+    }
 
 
 def _is_no(t: str) -> bool:
     t = _strip_accents(t)
-    return t in {"no", "nop", "no gracias", "nah", "negativo"}
+    return t in {"no", "nop", "no gracias", "nah", "negativo", "no quiero", "no, gracias"}
 
 
-def _parse_guarantee_choice(t: str) -> str:
-    nt = _strip_accents(t)
-    if nt.strip() in {"1", "1-", "1 -"} or "propietar" in nt or "caba" in nt:
-        return "Propietario CABA"
-    if nt.strip() in {"2", "2-", "2 -"} or "finaer" in nt or "caucion" in nt or "caución" in t.lower():
-        return "Caución FINAER"
-    if nt.strip() in {"3", "3-", "3 -"} or "ninguna" in nt or "no tengo" in nt or "sin garantia" in nt or "sin garantía" in t.lower():
-        return "Ninguna"
-    if "garantia" in nt or "garantía" in t.lower():
-        return "Ninguna"
-    return "Ninguna"
-
-
-# =============== Intents básicos ===============
 def _wants_reset(t: str) -> bool:
     t = _strip_accents(t)
     return t in {"reset", "reiniciar", "restart"}
@@ -532,8 +506,14 @@ def _wants_reset(t: str) -> bool:
 def _is_rental_intent(t: str) -> bool:
     t = _strip_accents(t)
     keys = [
-        "alquiler", "alquilo", "alquilar", "quiero alquilar",
-        "busco alquiler", "estoy buscando alquiler", "rentar", "arrendar"
+        "alquiler",
+        "alquilo",
+        "alquilar",
+        "quiero alquilar",
+        "busco alquiler",
+        "estoy buscando alquiler",
+        "rentar",
+        "arrendar",
     ]
     return any(k in t for k in keys) or t.strip() in {"1", "1-", "1 -", "alquileres"}
 
@@ -550,18 +530,6 @@ def _is_valuation_intent(t: str) -> bool:
     return any(k in t for k in keys) or t.strip() in {"3", "3-", "3 -"}
 
 
-def _is_opt_out(t: str) -> bool:
-    nt = _strip_accents(t)
-    nt = re.sub(r"[!¡¿?\.]", "", nt).strip()
-    return nt == "cancelar"
-
-
-def _is_reactivate(t: str) -> bool:
-    nt = _strip_accents(t)
-    nt = re.sub(r"[!¡¿?\.]", "", nt).strip()
-    return nt == "activar bot"
-
-
 def _is_zone_search(t: str) -> bool:
     nt = _strip_accents(t)
     patterns = [
@@ -573,7 +541,7 @@ def _is_zone_search(t: str) -> bool:
     ]
     return any(re.search(p, nt) for p in patterns)
 
-# ======== Tasación ========
+
 def _num_from_text(t: str) -> Optional[int]:
     m = re.search(r"\b(\d{1,5})\b", t or "")
     if not m:
@@ -601,7 +569,6 @@ def _has_addr_number_strict(t: str) -> bool:
     return bool(re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ\.]{3,}\s+\d{1,6}", t or ""))
 
 
-# =============== Conversación y estado ===============
 def _reset(chat_id: str):
     STATE[chat_id] = {"stage": "menu"}
 
@@ -611,98 +578,107 @@ def _ensure_session(chat_id: str):
         _reset(chat_id)
 
 
-# =============== Endpoint principal ===============
-@app.post("/qualify", response_model=QualifyOut)
-async def qualify(body: QualifyIn) -> QualifyOut:
+# ==================== MOTOR IA: REESCRIBIR RESPUESTA ====================
+
+def _rewrite_with_llama(chat_id: str, user_text: str, base_reply: str) -> str:
     """
-    Orquestador principal de la conversación.
-    Soporta:
-      - "reset"        -> reinicia la conversación
-      - "cancelar"     -> apaga el bot para este chat (silencio total)
-      - "activar bot"  -> vuelve a encender el bot (reset al menú)
-    Además, cuando se deriva a un asesor (vendor_push=True) se marca handoff
-    y el bot permanece en silencio hasta "activar bot".
+    Usa LLaMA-3 (Groq) para hacer la respuesta más conversacional,
+    manteniendo datos, links y estructura básica.
+    Si no hay IA configurada, devuelve base_reply tal cual.
     """
+    state = STATE.setdefault(chat_id, {})
+    history: List[Dict[str, str]] = state.setdefault("history", [])
+
+    if not base_reply or groq_client is None or not GROQ_API_KEY:
+        # Igual actualizamos historia básica
+        if user_text:
+            history.append({"role": "user", "content": user_text})
+        if base_reply:
+            history.append({"role": "assistant", "content": base_reply})
+        state["history"] = history[-20:]
+        return base_reply
+
+    system_msg = (
+        "Sos un asistente virtual inmobiliario argentino, cálido y claro.\n"
+        "Tu tarea es mejorar ligeramente el mensaje base que te doy, "
+        "haciéndolo más conversacional y humano, pero SIN cambiar los datos "
+        "numéricos, las condiciones, ni los links.\n"
+        "No inventes información nueva. No cambies montos, direcciones ni URLs.\n"
+        "Mantené emojis si ayudan, pero no satures.\n"
+        "Respondé siempre en español rioplatense."
+    )
+
+    messages = [{"role": "system", "content": system_msg}]
+    for h in history[-8:]:
+        messages.append(h)
+
+    if user_text:
+        messages.append({"role": "user", "content": user_text})
+
+    messages.append(
+        {
+            "role": "assistant",
+            "content": f"Mensaje base (no lo cambies de contenido, solo de tono):\n{base_reply}",
+        }
+    )
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model=LLAMA_MODEL,
+            messages=messages,
+            max_tokens=400,
+            temperature=0.4,
+        )
+        final_reply = completion.choices[0].message.content.strip()
+    except Exception:
+        final_reply = base_reply
+
+    if user_text:
+        history.append({"role": "user", "content": user_text})
+    if final_reply:
+        history.append({"role": "assistant", "content": final_reply})
+
+    state["history"] = history[-20:]
+    return final_reply
+
+
+# ==================== MOTOR ORIGINAL DE CALIFICACIÓN ====================
+
+def _process_qualify(body: QualifyIn) -> QualifyOut:
     chat_id = body.chatId
     text = (body.message or "").strip()
 
     _ensure_session(chat_id)
     s = STATE[chat_id]
 
-    # --------- CONTROL ENCENDIDO / APAGADO ---------
-    # Reactivar manualmente el bot
-    if _is_reactivate(text):
-        s["opt_out"] = False
-        s["handoff"] = False
-        _reset(chat_id)
-        return QualifyOut(
-            reply_text=_say_menu(),
-            vendor_push=False,
-            vendor_message="",
-            closing_text=""
-        )
-
-    # Apagar el bot con "cancelar"
-    if _is_opt_out(text):
-        s["opt_out"] = True
-        s["handoff"] = False
-        s["stage"] = "opt_out"
-        # Respondemos una vez con un aviso corto y luego quedará silencioso
-        return QualifyOut(
-            reply_text="OK, dejo de responder por este chat. Si querés volver a usar el asistente, escribí *activar bot*.",
-            vendor_push=False,
-            vendor_message="",
-            closing_text=""
-        )
-
-    # Si ya está apagado o derivado a un asesor, silencio total (char invisible)
-    if s.get("opt_out") or s.get("handoff"):
-        return QualifyOut(
-            reply_text=SILENCE_REPLY,
-            vendor_push=False,
-            vendor_message="",
-            closing_text=""
-        )
-
-    # Reset clásico
     if _wants_reset(text):
         _reset(chat_id)
-        return QualifyOut(
-            reply_text=_say_menu(),
-            vendor_push=False,
-            vendor_message="",
-            closing_text=""
-        )
+        return QualifyOut(reply_text=_say_menu())
 
     stage = s.get("stage", "menu")
 
-    # ================== MENU ==================
+    # --- MENU ---
     if stage == "menu":
         if not text:
             return QualifyOut(reply_text=_say_menu())
 
         user_op = "alquiler" if _is_rental_intent(text) else "venta" if _is_sale_intent(text) else None
 
-        # LINK directo en el primer mensaje
         row_link = _try_property_from_link_or_slug(text)
         if row_link:
-            prop_op = _infer_intent_from_row(row_link) or "venta"
-            if user_op and user_op != prop_op:
-                _reset(chat_id)
-                return QualifyOut(reply_text=_mismatch_msg(user_op, prop_op))
+            prop_op = _infer_intent_from_row(row_link) or (user_op or "venta")
             s["prop_row"] = row_link
             s["intent"] = user_op or prop_op
             brief = render_property_card_db(row_link, intent=s["intent"])
             s["prop_brief"] = brief
             s["stage"] = "show_property_asked_qualify"
-            if s["intent"] == "alquiler":
-                s["last_prompt"] = "qual_income"
-                return QualifyOut(reply_text=brief + "\n\n" + _ask_income_question())
-            else:
-                s["last_prompt"] = "qual_disp_venta"
-                return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt("venta"))
+            s["last_prompt"] = "qual_disp_alq" if s["intent"] == "alquiler" else "qual_disp_venta"
+            return QualifyOut(
+                reply_text=brief
+                + "\n\n"
+                + (_ask_disponibilidad() if s["intent"] == "alquiler" else _ask_qualify_prompt("venta"))
+            )
 
-        # Alquiler / Venta / Tasación sin link
         if user_op or _is_valuation_intent(text):
             s["intent"] = user_op or "tasacion"
             if s["intent"] == "tasacion":
@@ -715,22 +691,14 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 s["tas_feat"] = None
                 s["tas_disp"] = None
                 return QualifyOut(
-                    reply_text="¡Genial! Para la *tasación*, decime el *tipo de operación*: ¿venta o alquiler?",
-                    vendor_push=False,
-                    vendor_message="",
-                    closing_text=""
+                    reply_text="¡Genial! Para la *tasación*, decime el *tipo de operación*: ¿venta o alquiler?"
                 )
             s["stage"] = "ask_zone_or_address"
-            return QualifyOut(
-                reply_text=_ask_zone_or_address(),
-                vendor_push=False,
-                vendor_message="",
-                closing_text=""
-            )
+            return QualifyOut(reply_text=_ask_zone_or_address())
 
         return QualifyOut(reply_text=_say_menu())
 
-    # ========== TASACIÓN ==========
+    # --- TASACIÓN ---
     if stage == "tas_op":
         t = _strip_accents(text)
         if "venta" in t:
@@ -747,16 +715,12 @@ async def qualify(body: QualifyIn) -> QualifyOut:
     if stage == "tas_prop":
         s["tas_prop"] = text.strip() or "no informado"
         s["stage"] = "tas_m2"
-        return QualifyOut(
-            reply_text="Gracias. ¿Cuántos *metros cuadrados* aproximados tiene la propiedad?"
-        )
+        return QualifyOut(reply_text="Gracias. ¿Cuántos *metros cuadrados* aproximados tiene la propiedad?")
 
     if stage == "tas_m2":
         n = _num_from_text(text)
         if n is None:
-            return QualifyOut(
-                reply_text="¿Me pasás un *número* aproximado de metros cuadrados? (ej.: 65)"
-            )
+            return QualifyOut(reply_text="¿Me pasás un *número* aproximado de metros cuadrados? (ej.: 65)")
         s["tas_m2"] = n
         s["stage"] = "tas_dir"
         return QualifyOut(
@@ -780,11 +744,10 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             s["tas_exp"] = "no tiene"
         else:
             val = _money_from_text(text)
-            s["tas_exp"] = f"{val:,}".replace(",", ".") if val else (text.strip() or "no informado")
+            s["tas_exp"] = f"${val:,}".replace(",", ".") if val else (text.strip() or "no informado")
         s["stage"] = "tas_feat"
         return QualifyOut(
-            reply_text="¿Dispone *balcón, patio, amenities o estudio de factibilidad*? "
-                       "Podés responder con una lista (ej.: “balcón y amenities”) o “no”."
+            reply_text="¿Dispone *balcón, patio, amenities o estudio de factibilidad*? Podés responder con una lista o “no”."
         )
 
     if stage == "tas_feat":
@@ -809,7 +772,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
     if stage == "tas_disp":
         s["tas_disp"] = text.strip() or "no informado"
         s["stage"] = "done"
-        s["handoff"] = True  # a partir de ahora: silencio total
         resumen = (
             "Tasación solicitada ✅\n"
             f"• Operación: {s.get('tas_op','N/D')}\n"
@@ -822,36 +784,32 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             f"• Chat: {chat_id}"
         )
         cierre = (
-            "Perfecto, con todos estos datos ya cuento con lo suficiente para derivarte con un asesor, "
-            "muchísimas gracias por tu tiempo!"
+            "Perfecto, con todos estos datos ya contamos con lo suficiente para derivarte con un asesor. "
+            "¡Muchísimas gracias por tu tiempo!"
         )
         return QualifyOut(
             reply_text=cierre,
             vendor_push=True,
             vendor_message=resumen,
-            closing_text=""
+            closing_text="",
         )
 
-    # --- DIRECCIÓN / LINK ---
+    # --- BÚSQUEDA DIRECCIÓN / ZONA ---
     if stage == "ask_zone_or_address":
         row_link = _try_property_from_link_or_slug(text)
         if row_link:
             intent_infer = _infer_intent_from_row(row_link) or s.get("intent") or "venta"
-            if s.get("intent") and s["intent"] != intent_infer:
-                user_op = s["intent"]
-                _reset(chat_id)
-                return QualifyOut(reply_text=_mismatch_msg(user_op, intent_infer))
             s["prop_row"] = row_link
             s["intent"] = s.get("intent") or intent_infer
             brief = render_property_card_db(row_link, intent=s["intent"])
             s["prop_brief"] = brief
             s["stage"] = "show_property_asked_qualify"
-            if s["intent"] == "alquiler":
-                s["last_prompt"] = "qual_income"
-                return QualifyOut(reply_text=brief + "\n\n" + _ask_income_question())
-            else:
-                s["last_prompt"] = "qual_disp_venta"
-                return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt("venta"))
+            s["last_prompt"] = "qual_disp_alq" if s["intent"] == "alquiler" else "qual_disp_venta"
+            return QualifyOut(
+                reply_text=brief
+                + "\n\n"
+                + (_ask_disponibilidad() if s["intent"] == "alquiler" else _ask_qualify_prompt("venta"))
+            )
 
         if _is_zone_search(text):
             s["stage"] = "done"
@@ -860,33 +818,24 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 f"{SITE_URL}\n\n"
                 "Cualquier consulta puntual de una ficha me escribís por acá."
             )
-            return QualifyOut(
-                reply_text=msg,
-                vendor_push=False,
-                vendor_message="",
-                closing_text=_farewell()
-            )
+            return QualifyOut(reply_text=msg, closing_text=_farewell())
 
         intent = s.get("intent", "alquiler")
         row = search_db_by_address(text)
 
         if row:
             intent_infer = _infer_intent_from_row(row) or intent
-            if s.get("intent") and s["intent"] != intent_infer:
-                user_op = s["intent"]
-                _reset(chat_id)
-                return QualifyOut(reply_text=_mismatch_msg(user_op, intent_infer))
             brief = render_property_card_db(row, intent=intent_infer)
             s["prop_row"] = row
             s["prop_brief"] = brief
             s["intent"] = intent_infer
             s["stage"] = "show_property_asked_qualify"
-            if s["intent"] == "alquiler":
-                s["last_prompt"] = "qual_income"
-                return QualifyOut(reply_text=brief + "\n\n" + _ask_income_question())
-            else:
-                s["last_prompt"] = "qual_disp_venta"
-                return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt("venta"))
+            s["last_prompt"] = "qual_disp_alq" if s["intent"] == "alquiler" else "qual_disp_venta"
+            return QualifyOut(
+                reply_text=brief
+                + "\n\n"
+                + (_ask_disponibilidad() if s["intent"] == "alquiler" else _ask_qualify_prompt("venta"))
+            )
 
         return QualifyOut(
             reply_text=(
@@ -895,50 +844,23 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             )
         )
 
-    # --- CALIFICACIÓN ---
+    # --- MOSTRAR PROPIEDAD Y CALIFICAR ---
     if stage == "show_property_asked_qualify":
         intent = s.get("intent", "alquiler")
-        nt = _strip_accents(text)
 
         if intent == "alquiler":
-            if s.get("last_prompt") == "qual_income":
-                if _is_no(text):
-                    s["stage"] = "done"
-                    return QualifyOut(
-                        reply_text=(
-                            "Gracias por la info 🙏\n"
-                            "Por el momento, para avanzar con el alquiler es necesario cumplir con *todos los requisitos* "
-                            "(*ingresos demostrables* y *garantía válida*).\n\n"
-                            "Si más adelante contás con ellos, escribinos por este mismo chat y con gusto te ayudamos 💬\n\n"
-                            "🔄 Para reiniciar la conversación, enviá *\"reset\"*."
-                        ),
-                        vendor_push=False,
-                        vendor_message="",
-                        closing_text=_farewell()
-                    )
-
-                if _is_yes(text) or re.search(r"(ingreso|recibo|demostrable|monotrib|dependencia)", nt):
-                    s["last_prompt"] = "qual_guarantee"
-                    return QualifyOut(reply_text=_ask_guarantee_question())
-                return QualifyOut(
-                    reply_text=(
-                        "Te pido un segundito 🙌 ¿Podés confirmarme si *contás con ingresos demostrables* "
-                        "que tripliquen el alquiler? Respondé *sí* o *no*, así seguimos 😉"
-                    )
-                )
-
-            if s.get("last_prompt") == "qual_guarantee":
-                garantia = _parse_guarantee_choice(text)
-                s["garantia"] = garantia
+            if s.get("last_prompt") != "qual_disp_alq":
                 s["last_prompt"] = "qual_disp_alq"
                 return QualifyOut(reply_text=_ask_disponibilidad())
-
-            if s.get("last_prompt") == "qual_disp_alq":
+            else:
                 s["disp_alquiler"] = text.strip() or "no informado"
                 s["stage"] = "ask_handover"
                 s.pop("last_prompt", None)
                 return QualifyOut(
-                    reply_text="Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
+                    reply_text=(
+                        "Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? "
+                        "Respondé *sí* o *no*."
+                    )
                 )
 
         if intent == "venta":
@@ -950,44 +872,41 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 s["stage"] = "ask_handover"
                 s.pop("last_prompt", None)
                 return QualifyOut(
-                    reply_text="Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
+                    reply_text=(
+                        "Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? "
+                        "Respondé *sí* o *no*."
+                    )
                 )
 
-    # --- CONTACTO CON ASESOR ---
+    # --- PREGUNTAR DERIVACIÓN ---
     if stage == "ask_handover":
         s.pop("last_prompt", None)
 
         if _is_yes(text):
             s["stage"] = "done"
-            s["handoff"] = True  # a partir de ahora: silencio total
             disp = ""
             if s.get("disp_alquiler"):
                 disp = f"Disponibilidad: {s['disp_alquiler']}\n"
             elif s.get("disp_venta"):
                 disp = f"Disponibilidad: {s['disp_venta']}\n"
 
-            op_line = ""
-            if s.get("intent"):
-                op_line = f"Operación seleccionada: {s['intent'].capitalize()}\n"
-
-            gar_line = ""
-            if s.get("intent") == "alquiler" and s.get("garantia"):
-                gar_line = f"Garantía: {s['garantia']}\n"
-
+            op_line = f"Operación seleccionada: {s['intent'].capitalize()}\n" if s.get("intent") else ""
             vendor_msg = (
                 "Lead calificado desde WhatsApp.\n"
                 f"Chat: {chat_id}\n"
                 f"{op_line}"
-                f"{gar_line}"
                 f"{disp}"
                 f"{s.get('prop_brief','')}\n"
             )
 
             return QualifyOut(
-                reply_text="Perfecto, te derivo con un asesor humano que te contactará por acá. ¡Gracias!",
+                reply_text=(
+                    "Perfecto, te derivo con un asesor humano que te va a contactar por acá en breve. "
+                    "¡Gracias por escribir!"
+                ),
                 vendor_push=True,
                 vendor_message=vendor_msg,
-                closing_text=_farewell()
+                closing_text=_farewell(),
             )
 
         if _is_no(text):
@@ -997,19 +916,98 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                     "¡Gracias por tu consulta! Quedamos a disposición por cualquier otra duda.\n"
                     "Cuando quieras retomar, escribí *reset* y arrancamos desde cero."
                 ),
-                vendor_push=False,
-                vendor_message="",
-                closing_text=_farewell()
+                closing_text=_farewell(),
             )
 
         return QualifyOut(
             reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? Respondé *sí* o *no*."
         )
 
-    # ========== FALLBACK SILENCIOSO ==========
-    return QualifyOut(
-        reply_text=SILENCE_REPLY,
-        vendor_push=False,
-        vendor_message="",
-        closing_text=""
+    # Fallback: volvemos al menú
+    _reset(chat_id)
+    return QualifyOut(reply_text=_say_menu())
+
+
+# ==================== ENVÍO A WHATSAPP (GREEN API) ====================
+
+async def send_whatsapp_message(chat_id: str, text: str):
+    if not text or not chat_id:
+        return
+    if not (GREEN_INSTANCE_ID and GREEN_API_TOKEN):
+        # sin credenciales no hacemos nada
+        return
+
+    url = f"{GREEN_API_URL}/waInstance{GREEN_INSTANCE_ID}/sendMessage/{GREEN_API_TOKEN}"
+    payload = {"chatId": chat_id, "message": text}
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            await client.post(url, json=payload)
+    except Exception:
+        # en producción podrías loguear el error
+        pass
+
+
+# ==================== ENDPOINT /qualify (para pruebas) ====================
+
+@app.post("/qualify", response_model=QualifyOut)
+async def qualify_endpoint(body: QualifyIn) -> QualifyOut:
+    # ignore mensajes que sean del propio bot (por si alguien llama esto manualmente)
+    if body.isFromMe:
+        return QualifyOut(reply_text="", vendor_push=False, vendor_message="", closing_text="")
+
+    out = _process_qualify(body)
+    out.reply_text = _rewrite_with_llama(body.chatId, body.message or "", out.reply_text)
+    return out
+
+
+# ==================== ENDPOINT WEBHOOK DIRECTO DE GREEN ====================
+
+@app.post("/webhook")
+async def green_webhook(payload: dict):
+    """
+    Endpoint para recibir webhooks DIRECTO desde Green API.
+    Configurá en la consola de Green:
+        incomingWebhook = https://TU-APP.railway.app/webhook
+    """
+
+    type_webhook = payload.get("typeWebhook")
+
+    # Solo procesamos mensajes entrantes de texto
+    if type_webhook != "incomingMessageReceived":
+        return {"status": "ignored"}
+
+    sender = (payload.get("senderData") or {}) or {}
+    msg_data = (payload.get("messageData") or {}) or {}
+
+    chat_id = sender.get("chatId") or sender.get("sender")
+    sender_name = (
+        sender.get("senderName")
+        or sender.get("chatName")
+        or sender.get("senderContactName")
+        or ""
     )
+
+    text = ""
+    if msg_data.get("typeMessage") == "textMessage":
+        text = (msg_data.get("textMessageData") or {}).get("textMessage", "") or ""
+    else:
+        # si no es texto, por ahora ignoramos
+        return {"status": "no_text"}
+
+    if not chat_id or not text.strip():
+        return {"status": "no_chat_or_text"}
+
+    body = QualifyIn(chatId=chat_id, message=text, isFromMe=False, senderName=sender_name)
+    out = _process_qualify(body)
+    out.reply_text = _rewrite_with_llama(chat_id, text, out.reply_text)
+
+    # Respuesta al cliente
+    if out.reply_text:
+        await send_whatsapp_message(chat_id, out.reply_text)
+
+    # Derivación al vendedor
+    if out.vendor_push and out.vendor_message and VENDOR_CHAT_ID:
+        await send_whatsapp_message(VENDOR_CHAT_ID, out.vendor_message)
+
+    return {"status": "ok"}
